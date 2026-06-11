@@ -1,0 +1,12 @@
+flask
+flask-cors
+PyMuPDF
+pytesseract
+Pillow
+pdf2image
+opencv-python
+numpy
+pdf2docx
+python-docx
+openai
+python-dotenv
