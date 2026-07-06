@@ -115,6 +115,30 @@ def _load_font(doc, page, font_name, flags):
 
     return None, False
 
+def _font_covers_text(font_obj, text):
+    """
+    Return True only if every non-space character in `text` has a real glyph
+    in this font object. Embedded PDF fonts are almost always *subsetted* —
+    they only contain glyphs for characters that appeared in the original
+    document. If we blindly trust an embedded bold/serif font object just
+    because it loaded successfully, PyMuPDF's TextWriter will silently
+    substitute missing glyphs with a fallback face, which is why replacement
+    text (e.g. "Patel") can render in the wrong weight/style even though the
+    rest of the line looks correct. This check forces a fallback to a
+    style-matched builtin font whenever the embedded subset can't render the
+    replacement word.
+    """
+    if font_obj is None:
+        return False
+    try:
+        for ch in text:
+            if ch.isspace():
+                continue
+            if not font_obj.has_glyph(ord(ch)):
+                return False
+        return True
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Text-layer replacement
@@ -167,7 +191,7 @@ def replace_text_in_pdf(doc, find_word, replace_word):
         for (rect, baseline, fn, fs, color_int, flags), fill in zip(hits, fill_colors):
             text_color = _unpack_color(color_int)
             font_obj, is_real = _load_font(doc, page, fn, flags)
-            if is_real and font_obj:
+            if is_real and font_obj and _font_covers_text(font_obj, replace_word):
                 try:
                     tw = fitz.TextWriter(page.rect)
                     tw.append(baseline, replace_word, font=font_obj, fontsize=fs)
@@ -181,7 +205,6 @@ def replace_text_in_pdf(doc, find_word, replace_word):
                              fontsize=fs, color=text_color)
             total += 1
     return total
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image-layer replacement (OCR only)
@@ -348,7 +371,6 @@ def replace_text_in_images(doc, find_word, replace_word):
                 traceback.print_exc()
     return total
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # In-memory download store
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,7 +387,6 @@ def _store_put(data: bytes, mime: str, filename: str) -> str:
 def _store_pop(token: str):
     with _store_lock:
         return _store.pop(token, None)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
@@ -466,7 +487,6 @@ def replace():
                     "image_count": image_total, "total": total,
                     "pairs": pair_results})
 
-
 @app.route("/merge", methods=["POST"])
 def merge_pdfs():
     """Merge multiple uploaded PDFs into one."""
@@ -507,7 +527,6 @@ def merge_pdfs():
     return jsonify({"token": token, "pages": total_pages,
                     "errors": errors,
                     "filename": output_name})
-
 
 @app.route("/convert-to-docx", methods=["POST"])
 def convert_to_docx():
@@ -551,7 +570,6 @@ def convert_to_docx():
     )
     return jsonify({"token": token, "filename": f"{base}.docx"})
 
-
 def _convert_pdf_to_docx_pdf2docx(pdf_bytes):
     """Primary editable conversion path with conservative header repair."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
@@ -574,7 +592,6 @@ def _convert_pdf_to_docx_pdf2docx(pdf_bytes):
             except: pass
     return docx_bytes
 
-
 def _repair_docx_header_wrapping(docx_path, pdf_bytes):
     """
     pdf2docx sometimes fragments a PDF header line into many Word paragraphs.
@@ -593,7 +610,6 @@ def _repair_docx_header_wrapping(docx_path, pdf_bytes):
     if merges:
         docx.save(docx_path)
         print(f"[DOCX] Repaired {merges} fragmented header line(s)")
-
 
 def _extract_pdf_header_lines(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -616,7 +632,6 @@ def _extract_pdf_header_lines(pdf_bytes):
         doc.close()
     return lines[:8]
 
-
 def _extract_pdf_lines(page, y_limit=None):
     pdf_lines = []
     for block in page.get_text("dict").get("blocks", []):
@@ -632,7 +647,6 @@ def _extract_pdf_lines(page, y_limit=None):
                 pdf_lines.append({"text": text, "bbox": bbox})
     pdf_lines.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
     return pdf_lines
-
 
 def _merge_fragmented_paragraph_text(paragraphs, expected_text, max_parts=10):
     expected_norm = _norm_join_text(expected_text)
@@ -668,10 +682,8 @@ def _merge_fragmented_paragraph_text(paragraphs, expected_text, max_parts=10):
         i += 1
     return merges
 
-
 def _norm_join_text(text):
     return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
-
 
 def _replace_paragraph_text(para, text):
     first_run = para.runs[0] if para.runs else None
@@ -689,18 +701,15 @@ def _replace_paragraph_text(para, text):
     fmt.space_before = Pt(0)
     fmt.space_after = Pt(0)
 
-
 def _delete_paragraph(para):
     el = para._element
     parent = el.getparent()
     if parent is not None:
         parent.remove(el)
 
-
 PT_TO_EMU = 12700
 PT_PER_INCH = 72.0
 FULL_PAGE_IMAGE_INSET_PT = 1.0
-
 
 def _convert_pdf_to_docx_visual(pdf_bytes):
     """
@@ -745,14 +754,12 @@ def _convert_pdf_to_docx_visual(pdf_bytes):
     out.seek(0)
     return out.getvalue()
 
-
 def _set_visual_doc_defaults(docx):
     style = docx.styles["Normal"]
     style.paragraph_format.space_before = Pt(0)
     style.paragraph_format.space_after = Pt(0)
     style.paragraph_format.line_spacing = Pt(1)
     style.font.size = Pt(1)
-
 
 def _set_visual_section(section, page):
     section.page_width = Pt(page.rect.width)
@@ -764,14 +771,12 @@ def _set_visual_section(section, page):
     section.header_distance = Pt(0)
     section.footer_distance = Pt(0)
 
-
 def _prepare_zero_spacing_paragraph(para):
     para.alignment = WD_ALIGN_PARAGRAPH.LEFT
     fmt = para.paragraph_format
     fmt.space_before = Pt(0)
     fmt.space_after = Pt(0)
     fmt.line_spacing = Pt(1)
-
 
 def _convert_pdf_to_docx_hybrid(pdf_bytes):
     """
@@ -811,14 +816,12 @@ def _convert_pdf_to_docx_hybrid(pdf_bytes):
     out.seek(0)
     return out.getvalue()
 
-
 def _extract_page_layout_blocks(pdf, page):
     text_blocks = _extract_text_line_blocks(page)
     image_blocks = _extract_image_blocks(pdf, page)
     blocks = text_blocks + image_blocks
     blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0], 0 if b["kind"] == "image" else 1))
     return blocks
-
 
 def _extract_text_line_blocks(page):
     blocks = []
@@ -852,7 +855,6 @@ def _extract_text_line_blocks(page):
                 "spans": spans,
             })
     return blocks
-
 
 def _extract_image_blocks(pdf, page):
     blocks = []
@@ -888,7 +890,6 @@ def _extract_image_blocks(pdf, page):
             })
     return blocks
 
-
 def _set_docx_page_layout(section, page, blocks, image_only=False):
     section.page_width = Pt(page.rect.width)
     section.page_height = Pt(page.rect.height)
@@ -912,10 +913,8 @@ def _set_docx_page_layout(section, page, blocks, image_only=False):
     section.right_margin = Pt(right)
     section.bottom_margin = Pt(bottom)
 
-
 def _is_image_only_page(blocks):
     return any(b["kind"] == "image" for b in blocks) and not any(b["kind"] == "text" for b in blocks)
-
 
 def _write_layout_blocks(docx, page, blocks, prev_block):
     text_blocks = [b for b in blocks if b["kind"] == "text"]
@@ -942,21 +941,17 @@ def _write_layout_blocks(docx, page, blocks, prev_block):
         prev_block = block
     return prev_block
 
-
 def _is_float_image(img_block, text_blocks):
     return any(_y_overlaps(img_block["bbox"], tb["bbox"]) for tb in text_blocks)
 
-
 def _y_overlaps(a, b):
     return a[1] < b[3] and b[1] < a[3]
-
 
 def _gap_to_emu(prev_block, curr_block):
     if not prev_block:
         return 0
     gap_pt = float(curr_block["bbox"][1]) - float(prev_block["bbox"][3])
     return int(max(0.0, gap_pt) * PT_TO_EMU)
-
 
 def _add_text_block(container, block, prev_block=None):
     para = container.add_paragraph()
@@ -971,7 +966,6 @@ def _add_text_block(container, block, prev_block=None):
         run.font.size = Pt(span.get("size", 11))
         run.font.color.rgb = _int_color_to_rgb(span.get("color", 0))
 
-
 def _add_image_block(container, page, block, prev_block=None):
     para = container.add_paragraph()
     para.paragraph_format.space_before = Emu(_gap_to_emu(prev_block, block))
@@ -979,7 +973,6 @@ def _add_image_block(container, page, block, prev_block=None):
     run = para.add_run()
     width_in, height_in = _image_inches_for_page(page, block)
     run.add_picture(io.BytesIO(block["data"]), width=Inches(width_in), height=Inches(height_in))
-
 
 def _add_side_by_side_table(docx, page, img_block, text_blocks, prev_block=None):
     table = docx.add_table(rows=1, cols=2)
@@ -1014,7 +1007,6 @@ def _add_side_by_side_table(docx, page, img_block, text_blocks, prev_block=None)
         _add_text_block(text_cell, tb, prev_text)
         prev_text = tb
 
-
 def _add_page_snapshot(docx, page, prev_block=None):
     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), colorspace=fitz.csRGB)
     block = {
@@ -1026,7 +1018,6 @@ def _add_page_snapshot(docx, page, prev_block=None):
     }
     _add_image_block(docx, page, block, prev_block)
 
-
 def _image_inches_for_page(page, block):
     max_width_pt = max(36.0, page.rect.width)
     width_pt = min(float(block["width_pt"]), max_width_pt)
@@ -1034,14 +1025,11 @@ def _image_inches_for_page(page, block):
     height_pt = float(block["height_pt"]) * ratio
     return width_pt / PT_PER_INCH, height_pt / PT_PER_INCH
 
-
 def _max_span_size(block):
     return max((float(s.get("size", 11)) for s in block.get("spans", [])), default=11.0)
 
-
 def _int_color_to_rgb(color_int):
     return RGBColor((int(color_int) >> 16) & 0xFF, (int(color_int) >> 8) & 0xFF, int(color_int) & 0xFF)
-
 
 def _union_blocks(blocks):
     return {
@@ -1053,7 +1041,6 @@ def _union_blocks(blocks):
             max(b["bbox"][3] for b in blocks),
         )
     }
-
 
 def _remove_table_borders(table):
     tbl_pr = table._tbl.tblPr
@@ -1068,7 +1055,6 @@ def _remove_table_borders(table):
             borders.append(border)
         border.set(qn("w:val"), "nil")
 
-
 def _set_cell_width(cell, width_pt):
     width_twips = str(int(width_pt * 20))
     tc_pr = cell._tc.get_or_add_tcPr()
@@ -1078,8 +1064,6 @@ def _set_cell_width(cell, width_pt):
         tc_pr.append(tc_w)
     tc_w.set(qn("w:w"), width_twips)
     tc_w.set(qn("w:type"), "dxa")
-
-
 
 def _fix_docx_margins(docx_path, pdf_bytes):
     """
@@ -1165,10 +1149,6 @@ def _fix_docx_margins(docx_path, pdf_bytes):
         print(f"[DOCX] Margin fix failed: {e}")
         traceback.print_exc()
 
-
-
-
-
 def _extract_header_footer_info(pdf_bytes):
     """
     Detect consistent header/footer across pages.
@@ -1205,7 +1185,6 @@ def _extract_header_footer_info(pdf_bytes):
     ftr_info = _pick_dominant(page_footers, n)
     return hdr_info, ftr_info
 
-
 def _blocks_to_info(blocks):
     """Summarise text blocks into {text, font_size, bold, align}."""
     lines  = []
@@ -1227,7 +1206,6 @@ def _blocks_to_info(blocks):
     bold      = sum(bolds) > len(bolds) / 2
     return {"text": text, "font_size": font_size, "bold": bold}
 
-
 def _pick_dominant(infos, n_pages):
     """Return the most common non-None info if it appears on >50% of pages."""
     from collections import Counter
@@ -1241,7 +1219,6 @@ def _pick_dominant(infos, n_pages):
         if info and info["text"] == top_text:
             return info
     return None
-
 
 def _apply_headers_footers(docx_path, hdr_info, ftr_info):
     """Write hdr_info / ftr_info into Word header/footer sections
@@ -1282,7 +1259,6 @@ def _apply_headers_footers(docx_path, hdr_info, ftr_info):
     doc.save(docx_path)
     print(f"[DOCX] Applied header={hdr_info} footer={ftr_info}")
 
-
 def _set_hf_paragraph(hf_section, info):
     """Set text, font size and bold on the first paragraph of a header/footer."""
     # Clear existing paragraphs content
@@ -1301,7 +1277,6 @@ def _set_hf_paragraph(hf_section, info):
     run.bold      = info.get("bold", False)
     run.font.size = Pt(info.get("font_size", 11))
 
-
 @app.route("/download/<token>")
 def download(token):
     item = _store_pop(token)
@@ -1313,7 +1288,6 @@ def download(token):
         as_attachment=True,
         download_name=item["filename"]
     )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PDF Edit — change header dates & footer page numbers
@@ -1359,7 +1333,6 @@ def _parse_page_range(s, max_pages):
                 pages.add(p)
     return sorted(pages)
 
-
 def _redact_and_insert(page, doc, rect, new_text, span):
     """Redact old text region and insert new_text with same font/size/color."""
     # Sample background
@@ -1382,7 +1355,7 @@ def _redact_and_insert(page, doc, rect, new_text, span):
     origin  = fitz.Point(chars[0]["origin"][0], chars[0]["origin"][1])
 
     font_obj, is_real = _load_font(doc, page, fn, flags)
-    if is_real and font_obj:
+    if is_real and font_obj and _font_covers_text(font_obj, new_text):
         try:
             tw = fitz.TextWriter(page.rect)
             tw.append(origin, new_text, font=font_obj, fontsize=fs)
@@ -1393,7 +1366,6 @@ def _redact_and_insert(page, doc, rect, new_text, span):
                      fontname=_pick_builtin(fn, flags),
                      fontsize=fs, color=color)
     return True
-
 
 def _line_chars_from_rawdict(raw):
     """Return page text lines as character records with span metadata attached."""
@@ -1424,7 +1396,6 @@ def _line_chars_from_rawdict(raw):
     lines.sort(key=lambda cs: (min(c["bbox"][1] for c in cs), min(c["bbox"][0] for c in cs)))
     return lines
 
-
 def _rect_from_chars(chars, pad_x=1.5, pad_y=1.0):
     return fitz.Rect(
         min(c["bbox"][0] for c in chars) - pad_x,
@@ -1432,7 +1403,6 @@ def _rect_from_chars(chars, pad_x=1.5, pad_y=1.0):
         max(c["bbox"][2] for c in chars) + pad_x,
         max(c["bbox"][3] for c in chars) + pad_y,
     )
-
 
 def _sample_rect_fill(page, rect):
     fill = (1.0, 1.0, 1.0)
@@ -1443,7 +1413,6 @@ def _sample_rect_fill(page, rect):
     except Exception:
         pass
     return fill
-
 
 def _insert_like_chars(page, doc, chars, new_text, color_override=None):
     if not chars:
@@ -1458,8 +1427,9 @@ def _insert_like_chars(page, doc, chars, new_text, color_override=None):
     rect = _rect_from_chars(chars)
 
     font_obj, is_real = _load_font(doc, page, fn, flags)
+    use_embedded = is_real and font_obj and _font_covers_text(font_obj, new_text)
     for size in [fs, fs * 0.96, fs * 0.92, fs * 0.88, fs * 0.84, fs * 0.80]:
-        if is_real and font_obj:
+        if use_embedded:
             try:
                 tw = fitz.TextWriter(page.rect)
                 tw.append(origin, new_text, font=font_obj, fontsize=size)
@@ -1483,8 +1453,6 @@ def _insert_like_chars(page, doc, chars, new_text, color_override=None):
     except Exception:
         return False
 
-
-
 def _replace_header_dates_on_page(page, doc, new_date):
     h = page.rect.height
     w = page.rect.width
@@ -1494,7 +1462,6 @@ def _replace_header_dates_on_page(page, doc, new_date):
     if count:
         return count
     return _replace_dates_in_rect(page, doc, page.rect, new_date)
-
 
 def _replace_dates_in_rect(page, doc, rect, new_date):
     raw = page.get_text("rawdict", clip=rect, flags=fitz.TEXT_PRESERVE_WHITESPACE)
@@ -1524,7 +1491,6 @@ def _replace_dates_in_rect(page, doc, rect, new_date):
         if _insert_like_chars(page, doc, chars, new_date):
             count += 1
     return count
-
 
 def _edit_pdf(doc, date_rules, start_page_num):
     """
@@ -1571,7 +1537,6 @@ def _edit_pdf(doc, date_rules, start_page_num):
                 changes += 1
 
     return changes
-
 
 def _replace_page_number(page, doc, new_pg):
     """
@@ -1633,7 +1598,6 @@ def _replace_page_number(page, doc, new_pg):
         print(f"[EDIT] Page {page.number+1}: trailing footer '{old_num}' → '{new_pg}' in '{old_line.strip()}'")
     return ok
 
-
 def _insert_page_digits_like_chars(page, chars, new_text):
     """Write page digits without leading zeroes, right-aligned in old digit box."""
     if not chars:
@@ -1663,11 +1627,6 @@ def _insert_page_digits_like_chars(page, chars, new_text):
         return True
     except Exception:
         return False
-
-
-
-
-
 
 @app.route("/pdf-edit", methods=["POST"])
 def pdf_edit():
@@ -1708,7 +1667,6 @@ def pdf_edit():
     token    = _store_put(buf.getvalue(), "application/pdf", f"{out_stem}.pdf")
     return jsonify({"token": token, "changes": changes,
                     "filename": f"{out_stem}.pdf"})
-
 
 @app.route("/pdf-debug", methods=["POST"])
 def pdf_debug():
@@ -1762,12 +1720,9 @@ def pdf_debug():
     doc.close()
     return jsonify(result)
 
-
-
 @app.route("/")
 def index():
     return render_template("index.html")
-
 
 @app.route("/api/status")
 def status():
@@ -1780,7 +1735,6 @@ def status():
         "pdf2docx":      PDF2DOCX_AVAILABLE,
         "pymupdf":       fitz.__version__,
     })
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5055, debug=False)
