@@ -8,7 +8,7 @@ except ImportError:
     pass
 
 import numpy as np
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, render_template
 from flask_cors import CORS
 import fitz   # PyMuPDF
 
