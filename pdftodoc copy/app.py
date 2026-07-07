@@ -25,6 +25,7 @@ try:
     from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph as _Paragraph
     PYTHON_DOCX_AVAILABLE = True
 except ImportError:
     PYTHON_DOCX_AVAILABLE = False
@@ -475,20 +476,65 @@ def _convert_pdf_to_docx_pdf2docx(pdf_bytes):
             except: pass
     return docx_bytes
 
+def _iter_body_paragraphs(document):
+    """
+    Yield every paragraph in the document body, IN DOCUMENT ORDER, including
+    paragraphs nested inside tables (at any depth).
+
+    python-docx's `document.paragraphs` only returns top-level body
+    paragraphs and silently skips anything inside a table. pdf2docx commonly
+    rebuilds multi-column PDF headers/footers (e.g. "Subject Code | Subject
+    Name" on one row, "Enrollment No | Name" on the next) as a Word table to
+    preserve the column positions. If we only ever look at
+    `document.paragraphs`, that fragmented header text sitting inside the
+    table cells is invisible to both the header-wrap repair and the
+    duplicate-removal step — which is why it kept showing up as leftover
+    body text even after the real header was inserted correctly. Walking
+    every <w:p> element in the body (tables included) fixes that.
+    """
+    body = document.element.body
+    for p in body.iter(qn('w:p')):
+        yield _Paragraph(p, document)
+
+def _remove_empty_tables(document):
+    """Delete any table (including nested tables) whose cells are all
+    blank after duplicate header/footer text has been stripped out of it."""
+    def cells_all_empty(table):
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    return False
+        return True
+
+    def process(tables):
+        for table in list(tables):
+            for row in table.rows:
+                for cell in row.cells:
+                    process(cell.tables)
+            if cells_all_empty(table):
+                tbl_el = table._tbl
+                parent = tbl_el.getparent()
+                if parent is not None:
+                    parent.remove(tbl_el)
+
+    process(document.tables)
+
 def _repair_docx_header_wrapping(docx_path, pdf_bytes):
     """
-    pdf2docx sometimes fragments a PDF header line into many Word paragraphs.
-    Rebuild only lines that are known to be in the PDF header zone, leaving body
-    paragraphs alone.
+    pdf2docx sometimes fragments a PDF header line into many Word paragraphs
+    (including paragraphs nested inside a table, when it used a table to
+    preserve a multi-column header layout). Rebuild only lines that are
+    known to be in the PDF header zone, leaving other body content alone.
     """
     header_lines = _extract_pdf_header_lines(pdf_bytes)
     if not header_lines:
         return
 
     docx = DocxDocument(docx_path)
+    all_paragraphs = list(_iter_body_paragraphs(docx))
     merges = 0
     for expected in header_lines:
-        merges += _merge_fragmented_paragraph_text(docx.paragraphs, expected)
+        merges += _merge_fragmented_paragraph_text(all_paragraphs, expected)
 
     if merges:
         docx.save(docx_path)
@@ -1075,7 +1121,15 @@ def _extract_header_footer_info(pdf_bytes):
     return hdr_info, ftr_info
 
 def _blocks_to_info(blocks):
-    """Summarise text blocks into {text, font_size, bold}."""
+    """Summarise text blocks into {text, lines, font_size, bold}.
+
+    `lines` preserves the individual PDF line breaks (as opposed to `text`,
+    which joins everything with spaces) because pdf2docx / our own repair
+    step reconstruct the header as separate Word paragraphs — one per
+    original PDF line, or one per table cell for multi-column headers — not
+    as a single joined paragraph. Keeping the per-line breakdown lets the
+    dedup step match and remove each of those individual paragraphs.
+    """
     lines  = []
     sizes  = []
     bolds  = []
@@ -1093,7 +1147,7 @@ def _blocks_to_info(blocks):
     text      = " ".join(lines)
     font_size = round(sum(sizes)/len(sizes), 1) if sizes else 11.0
     bold      = sum(bolds) > len(bolds) / 2
-    return {"text": text, "font_size": font_size, "bold": bold}
+    return {"text": text, "lines": lines, "font_size": font_size, "bold": bold}
 
 def _norm_dynamic(text):
     """Normalize digit runs so 'Page 1' and 'Page 2' compare as the same
@@ -1134,6 +1188,11 @@ def _pick_dominant(infos, n_pages, allow_page_number=False):
         if info and _norm_dynamic(info["text"]) == top_norm:
             result = dict(info)
             result["template"] = top_norm
+            # Per-line templates let the dedup step match and strip each
+            # individual fragment/table-cell paragraph pdf2docx produced,
+            # not just a single paragraph containing the whole joined text
+            # (which usually doesn't exist as one paragraph at all).
+            result["line_templates"] = [_norm_dynamic(l) for l in info.get("lines", [])]
             result["has_page_number"] = (
                 allow_page_number and _detect_incrementing(infos)
             )
@@ -1208,24 +1267,42 @@ def _set_hf_paragraph(hf_section, info):
 def _apply_headers_footers(docx_path, hdr_info, ftr_info):
     """
     Write hdr_info/ftr_info into real Word header/footer sections, and strip
-    the duplicated per-page copies pdf2docx already placed in the body
-    (matched on the digit-normalized template so a changing page number
-    doesn't stop the duplicate from being detected).
+    the duplicated per-page copies pdf2docx already placed in the body.
+
+    Matching happens against BOTH the whole-block template and each
+    individual line's template, and scans EVERY paragraph in the body
+    including ones nested inside tables — pdf2docx frequently rebuilds a
+    multi-column PDF header (e.g. "Subject Code | Subject Name" and
+    "Enrollment No | Name" rows) as a Word table, and our header-wrap repair
+    reconstructs one paragraph per original PDF line rather than a single
+    paragraph for the whole header. Only checking `document.paragraphs`
+    (top-level only) or only the fully-joined text would miss these and
+    leave the duplicate sitting in the body, which is what was happening.
     """
     doc = DocxDocument(docx_path)
 
     templates_to_remove = set()
-    if hdr_info: templates_to_remove.add(hdr_info["template"])
-    if ftr_info: templates_to_remove.add(ftr_info["template"])
+    for info in (hdr_info, ftr_info):
+        if not info:
+            continue
+        templates_to_remove.add(info["template"])
+        templates_to_remove.update(info.get("line_templates", []))
+    templates_to_remove.discard("")
 
     paras_to_delete = [
-        para for para in doc.paragraphs
+        para for para in _iter_body_paragraphs(doc)
         if para.text.strip() and _norm_dynamic(para.text.strip()) in templates_to_remove
     ]
     for para in paras_to_delete:
         p = para._element
-        p.getparent().remove(p)
+        parent = p.getparent()
+        if parent is not None:
+            parent.remove(p)
     print(f"[DOCX] Removed {len(paras_to_delete)} duplicate header/footer paragraph(s) from body")
+
+    # A table that pdf2docx used purely to lay out the header/footer will
+    # now be fully empty — remove it so no stray blank box is left behind.
+    _remove_empty_tables(doc)
 
     for section in doc.sections:
         section.different_first_page_header_footer = False
