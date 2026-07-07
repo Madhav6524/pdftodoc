@@ -1103,10 +1103,14 @@ def _extract_header_footer_info(pdf_bytes):
         h  = page.rect.height
         w  = page.rect.width
 
-        # Header zone: top 10% of page
-        hdr_rect = fitz.Rect(0, 0, w, h * 0.10)
-        # Footer zone: bottom 10% of page
-        ftr_rect = fitz.Rect(0, h * 0.90, w, h)
+        # Header zone: top 20% of page (wide enough for a 2-line bold
+        # header like "Subject Code... | Subject Name..." / "Enrollment
+        # No... Name..." — 10% was clipping the second line off entirely,
+        # so it never made it into hdr_info and could never be matched or
+        # removed from the body).
+        hdr_rect = fitz.Rect(0, 0, w, h * 0.20)
+        # Footer zone: bottom 15% of page, for the same reason.
+        ftr_rect = fitz.Rect(0, h * 0.85, w, h)
 
         hdr_blocks = page.get_text("dict", clip=hdr_rect)["blocks"]
         ftr_blocks = page.get_text("dict", clip=ftr_rect)["blocks"]
@@ -1181,7 +1185,16 @@ def _pick_dominant(infos, n_pages, allow_page_number=False):
     norm_texts = [_norm_dynamic(i["text"]) if i else "" for i in infos]
     cnt = Counter(norm_texts)
     top_norm, top_count = cnt.most_common(1)[0]
-    if not top_norm or top_count < max(2, n_pages * 0.4):
+    if not top_norm:
+        return None
+
+    # On a single-page (or very short) document there's no "consistency
+    # across pages" to check — requiring 2+ occurrences (the old rule)
+    # meant a header/footer could NEVER be detected on a 1-page PDF, since
+    # only 1 occurrence is even possible. Only require repetition when
+    # there's more than one page to repeat across.
+    required = 1 if n_pages <= 1 else max(2, int(n_pages * 0.4))
+    if top_count < required:
         return None
 
     for info in infos:
