@@ -13,14 +13,6 @@ from flask_cors import CORS
 import fitz   # PyMuPDF
 
 try:
-    import pytesseract
-    from pytesseract import Output
-    from PIL import Image, ImageDraw, ImageFont
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
-
-try:
     from pdf2docx import Converter as PDFConverter
     PDF2DOCX_AVAILABLE = True
 except ImportError:
@@ -147,41 +139,92 @@ def _font_covers_text(font_obj, text):
 def replace_text_in_pdf(doc, find_word, replace_word):
     total = 0
     for page in doc:
+        raw = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
         hits = []
-        for blk in page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", []):
-            if blk.get("type") != 0: continue
+
+        for blk in raw.get("blocks", []):
+            if blk.get("type") != 0:
+                continue
             for line in blk.get("lines", []):
-                for span in line.get("spans", []):
-                    chars     = span.get("chars", [])
-                    if not chars: continue
-                    span_text = "".join(c.get("c","") for c in chars)
-                    fn    = span.get("font", "Helvetica")
-                    fs    = float(span.get("size", 11))
-                    color = int(span.get("color", 0))
-                    flags = int(span.get("flags", 0))
+                line_spans = line.get("spans", [])
+                if not line_spans:
+                    continue
+
+                # ── Determine the dominant font/style for this whole line ──
+                # PDFs (especially form-style templates) sometimes store one
+                # word in a different embedded font than the rest of the
+                # line (e.g. a filled-in name vs. the surrounding label
+                # text). If we blindly reuse the matched span's own font,
+                # the replacement can visually clash with its neighbors.
+                # Instead, vote by character count across all spans on the
+                # line and use whichever font/style wins, so the replaced
+                # word matches what the eye actually sees as "the line's
+                # font" rather than a possibly-mismatched per-span quirk.
+                font_votes = {}
+                for sp in line_spans:
+                    chars = sp.get("chars", [])
+                    if not chars:
+                        continue
+                    key = (sp.get("font", "Helvetica"), int(sp.get("flags", 0)))
+                    font_votes[key] = font_votes.get(key, 0) + len(chars)
+
+                if font_votes:
+                    dominant_font, dominant_flags = max(
+                        font_votes.items(), key=lambda kv: kv[1]
+                    )[0]
+                else:
+                    dominant_font, dominant_flags = ("Helvetica", 0)
+
+                line_has_mixed_fonts = len(font_votes) > 1
+
+                for span in line_spans:
+                    chars = span.get("chars", [])
+                    if not chars:
+                        continue
+                    span_text = "".join(c.get("c", "") for c in chars)
+                    fn_orig    = span.get("font", "Helvetica")
+                    fs         = float(span.get("size", 11))
+                    color      = int(span.get("color", 0))
+                    flags_orig = int(span.get("flags", 0))
+
                     idx = 0
                     while True:
                         pos = span_text.lower().find(find_word.lower(), idx)
-                        if pos == -1: break
-                        mc = chars[pos:pos+len(find_word)]
-                        if not mc: break
+                        if pos == -1:
+                            break
+                        mc = chars[pos:pos + len(find_word)]
+                        if not mc:
+                            break
                         x0 = mc[0]["bbox"][0]; y0 = min(c["bbox"][1] for c in mc)
                         x1 = mc[-1]["bbox"][2]; y1 = max(c["bbox"][3] for c in mc)
-                        hits.append((fitz.Rect(x0,y0,x1,y1),
-                                     fitz.Point(mc[0]["origin"]),
-                                     fn, fs, color, flags))
+
+                        # Use this span's own font only if the whole line is
+                        # already uniform. If the line mixes styles, trust
+                        # the dominant one instead of the matched span's.
+                        if line_has_mixed_fonts:
+                            use_font, use_flags = dominant_font, dominant_flags
+                        else:
+                            use_font, use_flags = fn_orig, flags_orig
+
+                        hits.append((
+                            fitz.Rect(x0, y0, x1, y1),
+                            fitz.Point(mc[0]["origin"]),
+                            use_font, fs, color, use_flags
+                        ))
                         idx = pos + 1
 
-        if not hits: continue
+        if not hits:
+            continue
 
         fill_colors = []
         for rect, *_ in hits:
-            fill = (1.0,1.0,1.0)
+            fill = (1.0, 1.0, 1.0)
             try:
-                pm = page.get_pixmap(clip=rect.irect, matrix=fitz.Matrix(1,1), colorspace=fitz.csRGB)
+                pm = page.get_pixmap(clip=rect.irect, matrix=fitz.Matrix(1, 1), colorspace=fitz.csRGB)
                 if pm.samples:
-                    fill = (pm.samples[0]/255.0, pm.samples[1]/255.0, pm.samples[2]/255.0)
-            except: pass
+                    fill = (pm.samples[0] / 255.0, pm.samples[1] / 255.0, pm.samples[2] / 255.0)
+            except:
+                pass
             fill_colors.append(fill)
 
         for (rect, *_), fill in zip(hits, fill_colors):
@@ -204,171 +247,6 @@ def replace_text_in_pdf(doc, find_word, replace_word):
                              fontname=_pick_builtin(fn, flags),
                              fontsize=fs, color=text_color)
             total += 1
-    return total
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Image-layer replacement (OCR only)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _sample_bg(arr, left, top, w, h):
-    ih, iw = arr.shape[:2]
-    px = []
-    for y in range(max(0,top), min(ih,top+min(5,h))):
-        for x in range(max(0,left), min(iw,left+min(5,w))):
-            px.append(arr[y,x,:3])
-    for y in range(max(0,top+h-5), min(ih,top+h)):
-        for x in range(max(0,left), min(iw,left+min(5,w))):
-            px.append(arr[y,x,:3])
-    if not px:
-        return (255,255,255)
-    avg = np.mean(px, axis=0)
-    return tuple(int(np.clip(c,0,255)) for c in avg)
-
-def _sample_text_color(arr, left, top, w, h, bg):
-    ih, iw = arr.shape[:2]
-    y0 = max(0,top); y1 = min(ih,top+h)
-    x0 = max(0,left); x1 = min(iw,left+w)
-    region = arr[y0:y1, x0:x1].reshape(-1,3).astype(float)
-    if len(region) == 0: return (0,0,0)
-    bg_arr = np.array(bg, dtype=float)
-    diffs  = np.abs(region - bg_arr).sum(axis=1)
-    thresh = max(40, diffs.max() * 0.25)
-    text_px = region[diffs > thresh]
-    if len(text_px) < 3:
-        lum = 0.299*bg[0]+0.587*bg[1]+0.114*bg[2]
-        return (0,0,0) if lum > 128 else (255,255,255)
-    avg = text_px.mean(axis=0)
-    return tuple(int(np.clip(c,0,255)) for c in avg)
-
-_PIL_FONTS_MONO = [
-    "/Library/Fonts/Courier New.ttf",
-    "/System/Library/Fonts/Menlo.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-]
-_PIL_FONTS_SANS = [
-    "/Library/Fonts/Arial.ttf",
-    "/System/Library/Fonts/Helvetica.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-]
-_PIL_FONTS_SERIF = [
-    "/Library/Fonts/Times New Roman.ttf",
-    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
-    "/Library/Fonts/Georgia.ttf",
-]
-
-def _pil_font(size, style="sans"):
-    candidates = {"mono": _PIL_FONTS_MONO, "serif": _PIL_FONTS_SERIF}.get(style, _PIL_FONTS_SANS)
-    for p in candidates:
-        try: return ImageFont.truetype(p, max(6, size))
-        except: pass
-    for p in _PIL_FONTS_SANS + _PIL_FONTS_MONO:
-        try: return ImageFont.truetype(p, max(6, size))
-        except: pass
-    return ImageFont.load_default()
-
-def _detect_font_style(pil_img):
-    arr = np.array(pil_img)
-    h, w = arr.shape[:2]
-    border = np.concatenate([
-        arr[:10, :, :3].reshape(-1,3),
-        arr[-10:, :, :3].reshape(-1,3),
-        arr[:, :10, :3].reshape(-1,3),
-        arr[:, -10:, :3].reshape(-1,3),
-    ])
-    bg_lum = 0.299*border[:,0].mean() + 0.587*border[:,1].mean() + 0.114*border[:,2].mean()
-    if bg_lum < 80:
-        return "mono", True
-    return "sans", False
-
-def _paint_bboxes(pil_img, bboxes, replace_word, arr, font_style="sans"):
-    iw, ih = pil_img.size
-    draw   = ImageDraw.Draw(pil_img)
-    n = 0
-    for bb in bboxes:
-        left = int(bb["x"]);  top = int(bb["y"])
-        bw   = int(bb["width"]); bh = int(bb["height"])
-        if bw < 2 or bh < 2: continue
-        bg = _sample_bg(arr, left, top, bw, bh)
-        fg = _sample_text_color(arr, left, top, bw, bh, bg)
-        draw.rectangle([max(0,left-2), max(0,top-2),
-                        min(iw,left+bw+2), min(ih,top+bh+2)], fill=bg)
-        font_sz = max(6, int(bh * 0.80))
-        font    = _pil_font(font_sz, font_style)
-        for _ in range(8):
-            try:
-                tb    = draw.textbbox((0,0), replace_word, font=font)
-                tw_px = tb[2] - tb[0]
-            except:
-                tw_px = bw
-            if tw_px <= bw or font_sz <= 6: break
-            font_sz = max(6, font_sz - 1)
-            font    = _pil_font(font_sz, font_style)
-        try:
-            tb   = draw.textbbox((0,0), replace_word, font=font)
-            xoff = left + max(0, (bw - (tb[2]-tb[0])) // 2)
-            yoff = top  + max(0, (bh - (tb[3]-tb[1])) // 2)
-        except:
-            xoff, yoff = left, top
-        draw.text((xoff, yoff), replace_word, fill=fg, font=font)
-        n += 1
-    return n
-
-def replace_text_in_images(doc, find_word, replace_word):
-    """OCR-based image text replacement."""
-    if not TESSERACT_AVAILABLE:
-        return 0
-    total = 0
-    done  = set()
-    for page in doc:
-        for img_info in page.get_images(full=True):
-            xref = img_info[0]
-            key  = (page.number, xref)
-            if key in done: continue
-            done.add(key)
-            try:
-                base = doc.extract_image(xref)
-                raw  = base["image"]
-                ext  = base.get("ext","png").lower()
-                pil  = Image.open(io.BytesIO(raw)).convert("RGB")
-                iw, ih = pil.size
-                if iw < 50 or ih < 15: continue
-
-                arr = np.array(pil)
-                font_style, _ = _detect_font_style(pil)
-
-                combined = {"text":[],"conf":[],"left":[],"top":[],"width":[],"height":[]}
-                for psm in ("6","3","11"):
-                    d = pytesseract.image_to_data(pil, output_type=Output.DICT,
-                                                  config=f"--oem 3 --psm {psm}")
-                    for k in combined: combined[k].extend(d[k])
-
-                bboxes = []
-                for i, w in enumerate(combined["text"]):
-                    if (w or "").strip().lower() != find_word.lower(): continue
-                    try: conf = int(combined["conf"][i])
-                    except: conf = -1
-                    if conf < 0: continue
-                    bboxes.append({
-                        "x":      int(combined["left"][i]),
-                        "y":      int(combined["top"][i]),
-                        "width":  int(combined["width"][i]),
-                        "height": int(combined["height"][i]),
-                    })
-
-                if not bboxes: continue
-
-                n = _paint_bboxes(pil, bboxes, replace_word, arr, font_style)
-                if n == 0: continue
-
-                buf = io.BytesIO()
-                fmt = "JPEG" if ext in ("jpg","jpeg") else "PNG"
-                kw  = {"quality":95,"subsampling":0} if fmt=="JPEG" else {}
-                pil.save(buf, format=fmt, **kw)
-                page.replace_image(xref, stream=buf.getvalue())
-                total += n
-                print(f"[OCR] xref={xref}: replaced {n}")
-            except Exception:
-                traceback.print_exc()
     return total
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -427,8 +305,7 @@ def replace():
     pdf_bytes  = file_obj.read()
     doc        = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    text_total  = 0
-    image_total = 0
+    text_total   = 0
     pair_results = []
 
     for pair in pairs:
@@ -436,11 +313,8 @@ def replace():
         rw = pair.get("replace", "").strip()
         if not fw: continue
         tc = replace_text_in_pdf(doc, fw, rw)
-        ic = replace_text_in_images(doc, fw, rw)
-        text_total  += tc
-        image_total += ic
-        pair_results.append({"find": fw, "replace": rw,
-                              "text": tc, "image": ic, "total": tc+ic})
+        text_total += tc
+        pair_results.append({"find": fw, "replace": rw, "total": tc})
 
     out_buf = io.BytesIO()
     doc.save(out_buf, garbage=4, deflate=True)
@@ -455,7 +329,7 @@ def replace():
     else:
         out_stem = f"{base}_modified"
 
-    total = text_total + image_total
+    total = text_total
 
     if out_fmt == "docx":
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
@@ -477,14 +351,14 @@ def replace():
                            fname_docx)
         return jsonify({"token": token, "filename": fname_docx,
                         "text_count": text_total,
-                        "image_count": image_total, "total": total,
+                        "total": total,
                         "pairs": pair_results})
 
     fname_pdf = f"{out_stem}.pdf"
     token = _store_put(pdf_out, "application/pdf", fname_pdf)
     return jsonify({"token": token, "filename": fname_pdf,
                     "text_count": text_total,
-                    "image_count": image_total, "total": total,
+                    "total": total,
                     "pairs": pair_results})
 
 @app.route("/merge", methods=["POST"])
@@ -571,7 +445,8 @@ def convert_to_docx():
     return jsonify({"token": token, "filename": f"{base}.docx"})
 
 def _convert_pdf_to_docx_pdf2docx(pdf_bytes):
-    """Primary editable conversion path with conservative header repair."""
+    """Primary editable conversion path: header-wrap repair + real Word
+    header/footer handling (including live PAGE/NUMPAGES fields)."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
         tf.write(pdf_bytes); tmp_pdf = tf.name
     tmp_docx = tmp_pdf.replace(".pdf", ".docx")
@@ -583,6 +458,14 @@ def _convert_pdf_to_docx_pdf2docx(pdf_bytes):
 
         if PYTHON_DOCX_AVAILABLE:
             _repair_docx_header_wrapping(tmp_docx, pdf_bytes)
+
+            try:
+                hdr_info, ftr_info = _extract_header_footer_info(pdf_bytes)
+                if hdr_info or ftr_info:
+                    _apply_headers_footers(tmp_docx, hdr_info, ftr_info)
+            except Exception as e:
+                print(f"[DOCX] Header/footer handling failed: {e}")
+                traceback.print_exc()
 
         with open(tmp_docx, "rb") as fh:
             docx_bytes = fh.read()
@@ -1149,12 +1032,18 @@ def _fix_docx_margins(docx_path, pdf_bytes):
         print(f"[DOCX] Margin fix failed: {e}")
         traceback.print_exc()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Header / footer detection & real Word header/footer application
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _extract_header_footer_info(pdf_bytes):
     """
-    Detect consistent header/footer across pages.
+    Detect a consistent header/footer across pages, tolerating a changing
+    page number inside the footer (e.g. "Page 1", "Page 2", ...).
     Returns (header_info, footer_info) where each is a dict:
-      {"text": str, "font_size": float, "bold": bool, "align": str}
-    or None if no consistent header/footer found.
+      {"text": str, "font_size": float, "bold": bool, "template": str,
+       "has_page_number": bool}
+    or None if no consistent header/footer was found.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     n   = doc.page_count
@@ -1181,12 +1070,12 @@ def _extract_header_footer_info(pdf_bytes):
 
     doc.close()
 
-    hdr_info = _pick_dominant(page_headers, n)
-    ftr_info = _pick_dominant(page_footers, n)
+    hdr_info = _pick_dominant(page_headers, n, allow_page_number=False)
+    ftr_info = _pick_dominant(page_footers, n, allow_page_number=True)
     return hdr_info, ftr_info
 
 def _blocks_to_info(blocks):
-    """Summarise text blocks into {text, font_size, bold, align}."""
+    """Summarise text blocks into {text, font_size, bold}."""
     lines  = []
     sizes  = []
     bolds  = []
@@ -1206,49 +1095,138 @@ def _blocks_to_info(blocks):
     bold      = sum(bolds) > len(bolds) / 2
     return {"text": text, "font_size": font_size, "bold": bold}
 
-def _pick_dominant(infos, n_pages):
-    """Return the most common non-None info if it appears on >50% of pages."""
-    from collections import Counter
-    texts = [i["text"] if i else "" for i in infos]
-    cnt   = Counter(texts)
-    top_text, top_count = cnt.most_common(1)[0]
-    if not top_text or top_count < max(2, n_pages * 0.4):
-        return None
-    # Find the full info dict for the dominant text
+def _norm_dynamic(text):
+    """Normalize digit runs so 'Page 1' and 'Page 2' compare as the same
+    template — lets us detect a stable footer even when the page number
+    inside it changes on every page."""
+    return re.sub(r'\d+', '#', text or "")
+
+def _detect_incrementing(infos):
+    """True if the first digit run increases by ~1 across consecutive pages
+    that have this info — a strong signal it's a live page number rather
+    than static text that happens to contain a digit."""
+    nums = []
     for info in infos:
-        if info and info["text"] == top_text:
-            return info
+        if not info:
+            continue
+        m = re.search(r'\d+', info["text"])
+        if m:
+            nums.append(int(m.group()))
+    if len(nums) < 2:
+        return False
+    diffs = [b - a for a, b in zip(nums, nums[1:])]
+    return sum(1 for d in diffs if d == 1) >= max(1, len(diffs) - 1)
+
+def _pick_dominant(infos, n_pages, allow_page_number=False):
+    """
+    Return the most common info, matching on a digit-normalized template so
+    that a changing page number ('Page 1' vs 'Page 2') doesn't prevent a
+    footer from being detected as consistent across pages.
+    """
+    from collections import Counter
+    norm_texts = [_norm_dynamic(i["text"]) if i else "" for i in infos]
+    cnt = Counter(norm_texts)
+    top_norm, top_count = cnt.most_common(1)[0]
+    if not top_norm or top_count < max(2, n_pages * 0.4):
+        return None
+
+    for info in infos:
+        if info and _norm_dynamic(info["text"]) == top_norm:
+            result = dict(info)
+            result["template"] = top_norm
+            result["has_page_number"] = (
+                allow_page_number and _detect_incrementing(infos)
+            )
+            return result
     return None
 
-def _apply_headers_footers(docx_path, hdr_info, ftr_info):
-    """Write hdr_info / ftr_info into Word header/footer sections
-    AND remove any duplicate paragraphs from the body that pdf2docx
-    already placed there."""
-    from docx.oxml.ns import qn
-    import lxml.etree as etree
+# ── Word field helpers (live PAGE / NUMPAGES instead of frozen numbers) ─────
 
+def _add_field(paragraph, field_code, placeholder="1"):
+    run = paragraph.add_run()
+    fld_begin = OxmlElement('w:fldChar'); fld_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText'); instr.set(qn('xml:space'), 'preserve')
+    instr.text = f' {field_code} '
+    fld_sep = OxmlElement('w:fldChar'); fld_sep.set(qn('w:fldCharType'), 'separate')
+    fld_text = OxmlElement('w:t'); fld_text.text = placeholder
+    fld_end = OxmlElement('w:fldChar'); fld_end.set(qn('w:fldCharType'), 'end')
+    r = run._r
+    for el in (fld_begin, instr, fld_sep, fld_text, fld_end):
+        r.append(el)
+
+_PAGE_OF_TOTAL_RE = re.compile(r'(\d+)(\s*(?:of|/)\s*)(\d+)', re.I)
+
+def _write_hf_text_with_fields(paragraph, text, use_fields):
+    """
+    Write text into a header/footer paragraph. If use_fields is True and the
+    text contains a page-number pattern, swap it for a live PAGE / NUMPAGES
+    field so it updates correctly per page in Word instead of staying frozen
+    at whatever number the source PDF happened to show.
+    """
+    if not use_fields:
+        paragraph.add_run(text)
+        return
+
+    m = _PAGE_OF_TOTAL_RE.search(text)
+    if m:
+        before, sep, after = text[:m.start()], m.group(2), text[m.end():]
+        if before: paragraph.add_run(before)
+        _add_field(paragraph, "PAGE", m.group(1))
+        paragraph.add_run(sep)
+        _add_field(paragraph, "NUMPAGES", m.group(3))
+        if after: paragraph.add_run(after)
+        return
+
+    m = re.search(r'\d+', text)
+    if m:
+        before, after = text[:m.start()], text[m.end():]
+        if before: paragraph.add_run(before)
+        _add_field(paragraph, "PAGE", m.group())
+        if after: paragraph.add_run(after)
+        return
+
+    paragraph.add_run(text)
+
+def _set_hf_paragraph(hf_section, info):
+    """Set text, font size and bold on the first paragraph of a
+    header/footer, using live page-number fields when appropriate."""
+    for para in hf_section.paragraphs:
+        for run in para.runs:
+            run.text = ""
+
+    if hf_section.paragraphs:
+        para = hf_section.paragraphs[0]
+    else:
+        para = hf_section.add_paragraph()
+
+    para.clear()
+    _write_hf_text_with_fields(para, info["text"], info.get("has_page_number", False))
+    if para.runs:
+        para.runs[0].bold      = info.get("bold", False)
+        para.runs[0].font.size = Pt(info.get("font_size", 11))
+
+def _apply_headers_footers(docx_path, hdr_info, ftr_info):
+    """
+    Write hdr_info/ftr_info into real Word header/footer sections, and strip
+    the duplicated per-page copies pdf2docx already placed in the body
+    (matched on the digit-normalized template so a changing page number
+    doesn't stop the duplicate from being detected).
+    """
     doc = DocxDocument(docx_path)
 
-    # Collect texts to strip from body
-    texts_to_remove = set()
-    if hdr_info:
-        texts_to_remove.add(hdr_info["text"].strip())
-    if ftr_info:
-        texts_to_remove.add(ftr_info["text"].strip())
+    templates_to_remove = set()
+    if hdr_info: templates_to_remove.add(hdr_info["template"])
+    if ftr_info: templates_to_remove.add(ftr_info["template"])
 
-    # ── 1. Remove matching body paragraphs ───────────────────────────────
-    paras_to_delete = []
-    for para in doc.paragraphs:
-        pt = para.text.strip()
-        if pt in texts_to_remove:
-            paras_to_delete.append(para)
-
+    paras_to_delete = [
+        para for para in doc.paragraphs
+        if para.text.strip() and _norm_dynamic(para.text.strip()) in templates_to_remove
+    ]
     for para in paras_to_delete:
         p = para._element
         p.getparent().remove(p)
     print(f"[DOCX] Removed {len(paras_to_delete)} duplicate header/footer paragraph(s) from body")
 
-    # ── 2. Apply to Word header / footer sections ─────────────────────────
     for section in doc.sections:
         section.different_first_page_header_footer = False
         if hdr_info:
@@ -1258,24 +1236,6 @@ def _apply_headers_footers(docx_path, hdr_info, ftr_info):
 
     doc.save(docx_path)
     print(f"[DOCX] Applied header={hdr_info} footer={ftr_info}")
-
-def _set_hf_paragraph(hf_section, info):
-    """Set text, font size and bold on the first paragraph of a header/footer."""
-    # Clear existing paragraphs content
-    for para in hf_section.paragraphs:
-        for run in para.runs:
-            run.text = ""
-
-    # Use first paragraph or add one
-    if hf_section.paragraphs:
-        para = hf_section.paragraphs[0]
-    else:
-        para = hf_section.add_paragraph()
-
-    para.clear()  # remove existing runs
-    run = para.add_run(info["text"])
-    run.bold      = info.get("bold", False)
-    run.font.size = Pt(info.get("font_size", 11))
 
 @app.route("/download/<token>")
 def download(token):
@@ -1726,14 +1686,9 @@ def index():
 
 @app.route("/api/status")
 def status():
-    ocr_ok = False
-    if TESSERACT_AVAILABLE:
-        try: pytesseract.get_tesseract_version(); ocr_ok = True
-        except: pass
     return jsonify({
-        "ocr_available": ocr_ok,
-        "pdf2docx":      PDF2DOCX_AVAILABLE,
-        "pymupdf":       fitz.__version__,
+        "pdf2docx": PDF2DOCX_AVAILABLE,
+        "pymupdf":  fitz.__version__,
     })
 
 if __name__ == "__main__":
